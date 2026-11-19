@@ -1,0 +1,196 @@
+name: Build TG-WS iOS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Bazel configuration (release_arm64 = optimized; debug_arm64 = faster build, less RAM)"
+        required: true
+        default: release_arm64
+        type: choice
+        options:
+          - release_arm64
+          - debug_arm64
+      bundle_id:
+        description: "Bundle id written into the re-signable IPA"
+        required: true
+        default: org.tgws.app
+      display_name:
+        description: "App name shown on the home screen"
+        required: true
+        default: TG WS
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: WsBridge host tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract WsBridge sources from the patch
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ws && cd /tmp/ws && git init -q
+          git apply --include='submodules/WsBridge/Sources/*' "$GITHUB_WORKSPACE/telegram-ios-ws.patch"
+          ls -la submodules/WsBridge/Sources
+
+      - name: Set up Swift
+        run: |
+          if ! command -v swiftc >/dev/null 2>&1; then
+            echo "swiftc not preinstalled on this runner image" >&2
+            exit 1
+          fi
+          swiftc --version
+
+      - name: Build and run parser / routing / store tests
+        run: |
+          set -euo pipefail
+          S=/tmp/ws/submodules/WsBridge/Sources
+          swiftc -o /tmp/wstests "$S/WsSubscription.swift" "$S/WsStore.swift" "$S/WsParser.swift" "$S/WsTarget.swift" tests/main.swift
+          /tmp/wstests
+
+      - name: Type-check WsConnection against Linux Foundation (informational)
+        continue-on-error: true
+        run: |
+          S=/tmp/ws/submodules/WsBridge/Sources
+          swiftc -typecheck "$S/WsSubscription.swift" "$S/WsConnection.swift"
+
+  build-ipa:
+    name: Build IPA (macOS 27 / Xcode 27.1)
+    needs: host-tests
+    runs-on: xcode-27
+    timeout-minutes: 355
+    env:
+      SOURCE_DIR: /Users/Shared/telegram-ios
+      CONFIGURATION: ${{ github.event.inputs.configuration || 'release_arm64' }}
+      BUNDLE_ID: ${{ github.event.inputs.bundle_id || 'org.tgws.app' }}
+      DISPLAY_NAME: ${{ github.event.inputs.display_name || 'TG WS' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ws
+
+      - name: Free disk space
+        run: |
+          df -h /
+          for x in /Applications/Xcode_*.app; do
+            case "$x" in
+              */Xcode_27.1.app) ;;
+              *) sudo rm -rf "$x" ;;
+            esac
+          done
+          sudo rm -rf "$HOME/Library/Android" /usr/local/share/dotnet "$HOME/.dotnet" "$HOME/.ghcup" || true
+          df -h /
+
+      - name: Fetch Telegram-iOS at the pinned commit and apply the WS patch
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Users/Shared
+          sudo chown "$(whoami)" /Users/Shared
+          git init -q "$SOURCE_DIR"
+          cd "$SOURCE_DIR"
+          git remote add origin https://github.com/TelegramMessenger/Telegram-iOS.git
+          git fetch -q --depth 1 origin "$(cat "$GITHUB_WORKSPACE/ws/UPSTREAM_COMMIT")"
+          git checkout -q FETCH_HEAD
+          git submodule update --init --recursive --depth 1 --jobs 8
+          git apply --whitespace=nowarn "$GITHUB_WORKSPACE/ws/telegram-ios-ws.patch"
+          git status --short | head -50
+          # keep memory pressure manageable on the hosted runner
+          echo "build --jobs=3" >> .bazelrc
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          XCODE_VERSION=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["xcode"])' "$SOURCE_DIR/versions.json")
+          if [ -d "/Applications/Xcode_${XCODE_VERSION}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          fi
+          xcodebuild -version
+          sw_vers
+
+      - name: Restore bazel cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-${{ env.CONFIGURATION }}-${{ hashFiles('ws/UPSTREAM_COMMIT') }}-${{ github.run_id }}
+          restore-keys: |
+            bazel-${{ env.CONFIGURATION }}-${{ hashFiles('ws/UPSTREAM_COMMIT') }}-
+
+      - name: Build
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          if [ -n "${TG_API_ID:-}" ] && [ -n "${TG_API_HASH:-}" ]; then
+            # optional: your own api_id / api_hash from my.telegram.org (repository secrets)
+            python3 -c 'import json,os;p="build-system/appstore-configuration.json";c=json.load(open(p));c["api_id"]=os.environ["TG_API_ID"];c["api_hash"]=os.environ["TG_API_HASH"];json.dump(c,open(p,"w"),indent=2)'
+            echo "using api_id from repository secrets"
+          fi
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            build \
+            --continueOnError \
+            --configurationPath=build-system/appstore-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration="$CONFIGURATION" \
+            --buildNumber=${{ github.run_number }} \
+            --outputBuildArtifactsPath="$SOURCE_DIR/build/artifacts" 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Collect compiler errors
+        if: failure()
+        run: |
+          grep -E "error:|ERROR:" "$RUNNER_TEMP/build.log" | grep -v "^INFO" | sort -u | head -300 > "$RUNNER_TEMP/errors.txt" || true
+          cat "$RUNNER_TEMP/errors.txt"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            ${{ runner.temp }}/build.log
+            ${{ runner.temp }}/errors.txt
+          if-no-files-found: ignore
+
+      - name: Save bazel cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-${{ env.CONFIGURATION }}-${{ hashFiles('ws/UPSTREAM_COMMIT') }}-${{ github.run_id }}
+
+      - name: Make re-signable IPA (no extensions, own bundle id)
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/out"
+          mkdir -p "$OUT/stage"
+          cp "$SOURCE_DIR/build/artifacts/Telegram.ipa" "$OUT/Telegram-original-fake-signed.ipa"
+          cd "$OUT/stage"
+          unzip -q "$OUT/Telegram-original-fake-signed.ipa"
+          APP=$(ls -d Payload/*.app | head -1)
+          rm -rf "$APP/PlugIns" "$APP/Watch" "$APP/Extensions" "$APP/_CodeSignature"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DISPLAY_NAME" "$APP/Info.plist" || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $DISPLAY_NAME" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
+          zip -qry "$OUT/TG-WS.ipa" Payload
+          ls -lh "$OUT"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TG-WS-ipa-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/out/TG-WS.ipa
+            ${{ runner.temp }}/out/Telegram-original-fake-signed.ipa
+          retention-days: 30
