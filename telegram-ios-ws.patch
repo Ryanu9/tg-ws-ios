@@ -2448,11 +2448,14 @@ index 00000000..8ea28131
 +}
 diff --git a/submodules/WsBridge/Sources/WsSubscription.swift b/submodules/WsBridge/Sources/WsSubscription.swift
 new file mode 100644
-index 00000000..b45b4aed
+index 00000000..90ccb5e3
 --- /dev/null
 +++ b/submodules/WsBridge/Sources/WsSubscription.swift
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,138 @@
 +import Foundation
++#if canImport(FoundationNetworking)
++import FoundationNetworking
++#endif
 +
 +/// One WebSocket endpoint. Each one (or each blogger inside it) becomes a local broadcast channel.
 +public struct WsSubscription: Codable, Equatable {
